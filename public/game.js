@@ -16,6 +16,7 @@ class BoatBattleFPS {
         this.currentWeapon = 'rifle';
         this.weaponSlots = ['rifle', 'pistol', 'shotgun'];
         this.islandColliders = [];
+        this.sounds = {};
         
         this.keys = {};
         this.mouse = { x: 0, y: 0 };
@@ -34,8 +35,10 @@ class BoatBattleFPS {
         this.water = null;
         
         this.init();
+        this.initSounds();
         this.setupEventListeners();
         this.setupSocketEvents();
+        this.updateUI(); // Initialize UI
         this.animate();
     }
     
@@ -60,6 +63,50 @@ class BoatBattleFPS {
         
         this.createWater();
         this.createPlayerBoat();
+    }
+    
+    initSounds() {
+        // Create basic sound effects using Web Audio API
+        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        
+        this.sounds = {
+            shoot: this.createSound(800, 0.1, 'square'),
+            exit: this.createSound(400, 0.2, 'sine'),
+            enter: this.createSound(600, 0.2, 'sine'),
+            hit: this.createSound(200, 0.1, 'sawtooth'),
+            engine: null // Will be a continuous sound
+        };
+    }
+    
+    createSound(frequency, duration, type = 'sine') {
+        return () => {
+            if (!this.audioContext) return;
+            
+            const oscillator = this.audioContext.createOscillator();
+            const gainNode = this.audioContext.createGain();
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(this.audioContext.destination);
+            
+            oscillator.frequency.value = frequency;
+            oscillator.type = type;
+            
+            gainNode.gain.setValueAtTime(0.1, this.audioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + duration);
+            
+            oscillator.start(this.audioContext.currentTime);
+            oscillator.stop(this.audioContext.currentTime + duration);
+        };
+    }
+    
+    playSound(soundName) {
+        if (this.sounds[soundName] && typeof this.sounds[soundName] === 'function') {
+            try {
+                this.sounds[soundName]();
+            } catch (e) {
+                console.log('Sound playback failed:', e);
+            }
+        }
     }
     
     createWater() {
@@ -223,6 +270,11 @@ class BoatBattleFPS {
         });
         
         document.addEventListener('click', () => {
+            // Enable audio context on first user interaction
+            if (this.audioContext && this.audioContext.state === 'suspended') {
+                this.audioContext.resume();
+            }
+            
             if (!this.isPointerLocked) {
                 this.renderer.domElement.requestPointerLock();
             } else {
@@ -353,9 +405,9 @@ class BoatBattleFPS {
         
         // Fix WASD directions - forward/back based on boat rotation
         const boatForward = new THREE.Vector3(
-            Math.sin(this.boat.rotation.y),
+            -Math.sin(this.boat.rotation.y), // Negative for correct forward
             0,
-            Math.cos(this.boat.rotation.y)
+            -Math.cos(this.boat.rotation.y)  // Negative for correct forward
         );
         const boatRight = new THREE.Vector3(
             Math.cos(this.boat.rotation.y),
@@ -431,6 +483,7 @@ class BoatBattleFPS {
             }
         };
         
+        this.playSound('shoot');
         this.socket.emit('playerShoot', bulletData);
     }
     
@@ -438,6 +491,15 @@ class BoatBattleFPS {
         document.getElementById('health').textContent = this.playerData.health;
         document.getElementById('boatHealth').textContent = this.playerData.boatHealth;
         document.getElementById('score').textContent = this.playerData.score;
+        
+        // Update mode indicator
+        const modeText = this.onFoot ? '👤 On Foot' : '🚤 In Boat';
+        if (!document.getElementById('mode')) {
+            const modeDiv = document.createElement('div');
+            modeDiv.id = 'mode';
+            document.getElementById('ui').appendChild(modeDiv);
+        }
+        document.getElementById('mode').textContent = modeText;
     }
     
     updatePlayerCount() {
@@ -470,16 +532,26 @@ class BoatBattleFPS {
         if (this.onFoot) return;
         
         this.onFoot = true;
+        
+        // Store boat position and camera transform
+        const boatWorldPos = new THREE.Vector3();
+        this.boat.getWorldPosition(boatWorldPos);
+        
+        const cameraWorldPos = new THREE.Vector3();
+        const cameraWorldRot = new THREE.Euler();
+        this.camera.getWorldPosition(cameraWorldPos);
+        this.camera.getWorldQuaternion(new THREE.Quaternion().setFromEuler(cameraWorldRot));
+        
+        // Remove camera from boat
         this.boat.remove(this.camera);
         this.scene.add(this.camera);
         
-        // Position camera next to boat
-        this.camera.position.set(
-            this.boat.position.x + 15,
-            10,
-            this.boat.position.z
-        );
+        // Position camera next to boat with proper world coordinates
+        this.camera.position.copy(cameraWorldPos);
+        this.camera.position.x += 15;
+        this.camera.position.y = 5; // Ground level
         
+        this.playSound('exit');
         console.log('Exited boat - Press F near boat to re-enter');
     }
     
@@ -488,16 +560,20 @@ class BoatBattleFPS {
         
         // Check if near boat
         const distance = this.camera.position.distanceTo(this.boat.position);
-        if (distance > 20) {
-            console.log('Too far from boat!');
+        if (distance > 25) {
+            console.log('Too far from boat! Distance: ' + Math.round(distance));
             return;
         }
         
         this.onFoot = false;
         this.scene.remove(this.camera);
         this.boat.add(this.camera);
-        this.camera.position.set(0, 12, 5);
         
+        // Reset camera to boat position
+        this.camera.position.set(0, 12, 5);
+        this.camera.rotation.set(0, 0, 0);
+        
+        this.playSound('enter');
         console.log('Entered boat');
     }
     
