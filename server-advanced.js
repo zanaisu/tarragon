@@ -1,1 +1,474 @@
-const express = require('express');\nconst http = require('http');\nconst socketIo = require('socket.io');\nconst { v4: uuidv4 } = require('uuid');\n\nconst app = express();\nconst server = http.createServer(app);\nconst io = socketIo(server, {\n  cors: {\n    origin: \"*\",\n    methods: [\"GET\", \"POST\"]\n  }\n});\n\nconst PORT = process.env.PORT || 3000;\nconst MAX_PLAYERS = 100;\nconst TICK_RATE = 60; // Server update rate\nconst MS_PER_TICK = 1000 / TICK_RATE;\n\n// Advanced game state\nconst gameState = {\n  players: new Map(),\n  boats: new Map(),\n  projectiles: new Map(),\n  powerUps: new Map(),\n  islands: generateAdvancedIslands(),\n  gameStats: {\n    totalKills: 0,\n    totalDeaths: 0,\n    gameStartTime: Date.now(),\n    playersJoined: 0\n  },\n  weather: {\n    type: 'clear', // clear, rain, storm, fog\n    intensity: 0,\n    windDirection: { x: 1, y: 0, z: 0.5 },\n    windStrength: 0.3\n  },\n  timeOfDay: 0.5 // 0 = midnight, 0.5 = noon\n};\n\n// Anti-cheat system\nconst antiCheat = {\n  playerPositions: new Map(),\n  shotCooldowns: new Map(),\n  speedChecks: new Map(),\n  damageValidation: new Map()\n};\n\n// Rate limiting\nconst rateLimits = {\n  movement: new Map(),\n  shooting: new Map(),\n  chat: new Map()\n};\n\nfunction generateAdvancedIslands() {\n  const islands = [];\n  const islandCount = 25;\n  \n  for (let i = 0; i < islandCount; i++) {\n    const island = {\n      id: uuidv4(),\n      x: (Math.random() - 0.5) * 4000,\n      z: (Math.random() - 0.5) * 4000,\n      radius: 40 + Math.random() * 120,\n      height: 15 + Math.random() * 50,\n      type: Math.random() > 0.7 ? 'rocky' : 'tropical',\n      powerUps: []\n    };\n    \n    // Add power-ups to larger islands\n    if (island.radius > 80) {\n      const powerUpCount = 2 + Math.floor(Math.random() * 3);\n      for (let j = 0; j < powerUpCount; j++) {\n        const powerUp = {\n          id: uuidv4(),\n          type: ['health', 'armor', 'ammo', 'weapon'][Math.floor(Math.random() * 4)],\n          x: island.x + (Math.random() - 0.5) * (island.radius - 10),\n          z: island.z + (Math.random() - 0.5) * (island.radius - 10),\n          y: island.height + 2,\n          respawnTime: 30000, // 30 seconds\n          lastTaken: 0\n        };\n        island.powerUps.push(powerUp);\n        gameState.powerUps.set(powerUp.id, powerUp);\n      }\n    }\n    \n    islands.push(island);\n  }\n  \n  return islands;\n}\n\nfunction validatePlayerPosition(playerId, newPosition, oldPosition, deltaTime) {\n  if (!oldPosition) return true;\n  \n  const distance = Math.sqrt(\n    Math.pow(newPosition.x - oldPosition.x, 2) +\n    Math.pow(newPosition.z - oldPosition.z, 2)\n  );\n  \n  const maxSpeed = 35; // m/s (generous for boats)\n  const maxDistance = maxSpeed * deltaTime;\n  \n  if (distance > maxDistance) {\n    console.log(`[ANTI-CHEAT] Player ${playerId} moved too fast: ${distance}m in ${deltaTime}s`);\n    return false;\n  }\n  \n  return true;\n}\n\nfunction validateShot(playerId, weaponType) {\n  const now = Date.now();\n  const lastShot = antiCheat.shotCooldowns.get(playerId) || 0;\n  \n  // Weapon fire rates (shots per minute)\n  const fireRates = {\n    'rifle': 600,\n    'pistol': 300,\n    'shotgun': 120,\n    'sniper': 40,\n    'smg': 800,\n    'lmg': 500\n  };\n  \n  const fireRate = fireRates[weaponType] || 600;\n  const minInterval = (60 / fireRate) * 1000; // Convert to milliseconds\n  \n  if (now - lastShot < minInterval * 0.8) { // Allow 20% tolerance\n    console.log(`[ANTI-CHEAT] Player ${playerId} firing too fast with ${weaponType}`);\n    return false;\n  }\n  \n  antiCheat.shotCooldowns.set(playerId, now);\n  return true;\n}\n\nfunction checkRateLimit(type, playerId, limit = 10, window = 1000) {\n  const now = Date.now();\n  \n  if (!rateLimits[type].has(playerId)) {\n    rateLimits[type].set(playerId, []);\n  }\n  \n  const timestamps = rateLimits[type].get(playerId);\n  \n  // Remove old timestamps\n  while (timestamps.length > 0 && now - timestamps[0] > window) {\n    timestamps.shift();\n  }\n  \n  if (timestamps.length >= limit) {\n    return false;\n  }\n  \n  timestamps.push(now);\n  return true;\n}\n\nfunction calculateDamage(weapon, distance, targetArmor) {\n  const weapons = {\n    'rifle': { damage: 35, range: 800, falloff: 0.3 },\n    'pistol': { damage: 65, range: 400, falloff: 0.4 },\n    'shotgun': { damage: 25, range: 200, falloff: 0.6, pellets: 8 },\n    'sniper': { damage: 150, range: 2000, falloff: 0.1 },\n    'smg': { damage: 28, range: 300, falloff: 0.5 },\n    'lmg': { damage: 45, range: 1000, falloff: 0.2 }\n  };\n  \n  const weaponData = weapons[weapon] || weapons['rifle'];\n  let damage = weaponData.damage;\n  \n  // Apply distance falloff\n  if (distance > weaponData.range * 0.3) {\n    const falloffFactor = 1 - ((distance - weaponData.range * 0.3) / (weaponData.range * 0.7));\n    damage *= Math.max(0.2, falloffFactor);\n  }\n  \n  // Apply armor reduction\n  if (targetArmor > 0) {\n    const armorReduction = Math.min(targetArmor, damage * 0.7);\n    damage -= armorReduction;\n  }\n  \n  return Math.round(damage);\n}\n\nfunction updateGameWorld() {\n  // Update time of day\n  gameState.timeOfDay += 0.001; // Slow progression\n  if (gameState.timeOfDay > 1) gameState.timeOfDay = 0;\n  \n  // Update weather\n  if (Math.random() < 0.001) { // 0.1% chance per tick to change weather\n    const weatherTypes = ['clear', 'rain', 'storm', 'fog'];\n    gameState.weather.type = weatherTypes[Math.floor(Math.random() * weatherTypes.length)];\n    gameState.weather.intensity = Math.random();\n  }\n  \n  // Update projectiles\n  const now = Date.now();\n  for (const [id, projectile] of gameState.projectiles) {\n    projectile.age += MS_PER_TICK;\n    \n    // Update position\n    projectile.x += projectile.vx * (MS_PER_TICK / 1000);\n    projectile.y += projectile.vy * (MS_PER_TICK / 1000);\n    projectile.z += projectile.vz * (MS_PER_TICK / 1000);\n    \n    // Apply gravity\n    projectile.vy -= 9.81 * (MS_PER_TICK / 1000);\n    \n    // Check for collisions or expiry\n    if (projectile.age > 5000 || projectile.y < 0) {\n      gameState.projectiles.delete(id);\n      io.emit('projectileExpired', id);\n    }\n  }\n  \n  // Respawn power-ups\n  for (const [id, powerUp] of gameState.powerUps) {\n    if (powerUp.taken && now - powerUp.lastTaken > powerUp.respawnTime) {\n      powerUp.taken = false;\n      io.emit('powerUpRespawned', { id: id, type: powerUp.type, position: { x: powerUp.x, y: powerUp.y, z: powerUp.z } });\n    }\n  }\n}\n\napp.use(express.static('public'));\n\nio.on('connection', (socket) => {\n  console.log(`[${new Date().toISOString()}] Player connected: ${socket.id}`);\n  \n  // Check server capacity\n  if (gameState.players.size >= MAX_PLAYERS) {\n    socket.emit('serverFull', { message: 'Server is full. Please try again later.' });\n    socket.disconnect();\n    return;\n  }\n  \n  // Initialize player\n  const player = {\n    id: socket.id,\n    username: `Player${gameState.players.size + 1}`,\n    x: (Math.random() - 0.5) * 1000,\n    y: 2,\n    z: (Math.random() - 0.5) * 1000,\n    rotation: 0,\n    health: 100,\n    maxHealth: 100,\n    armor: 0,\n    maxArmor: 100,\n    score: 0,\n    kills: 0,\n    deaths: 0,\n    weapon: 'rifle',\n    onFoot: false,\n    lastUpdate: Date.now(),\n    joinTime: Date.now()\n  };\n  \n  const boat = {\n    id: socket.id,\n    x: player.x,\n    z: player.z,\n    rotation: 0,\n    velocity: { x: 0, z: 0 },\n    health: 100,\n    maxHealth: 100\n  };\n  \n  gameState.players.set(socket.id, player);\n  gameState.boats.set(socket.id, boat);\n  gameState.gameStats.playersJoined++;\n  \n  // Initialize anti-cheat tracking\n  antiCheat.playerPositions.set(socket.id, { x: player.x, z: player.z, timestamp: Date.now() });\n  antiCheat.shotCooldowns.set(socket.id, 0);\n  \n  // Send initial game state\n  socket.emit('gameInit', {\n    playerId: socket.id,\n    gameState: {\n      players: Array.from(gameState.players.values()),\n      boats: Array.from(gameState.boats.values()),\n      islands: gameState.islands,\n      powerUps: Array.from(gameState.powerUps.values()).filter(p => !p.taken),\n      weather: gameState.weather,\n      timeOfDay: gameState.timeOfDay\n    }\n  });\n  \n  // Notify other players\n  socket.broadcast.emit('playerJoined', { \n    player: player, \n    boat: boat \n  });\n  \n  // Player movement\n  socket.on('playerMove', (data) => {\n    if (!checkRateLimit('movement', socket.id, 30, 1000)) {\n      return; // Rate limited\n    }\n    \n    const player = gameState.players.get(socket.id);\n    const boat = gameState.boats.get(socket.id);\n    \n    if (!player || !boat) return;\n    \n    const now = Date.now();\n    const deltaTime = (now - player.lastUpdate) / 1000;\n    \n    // Validate position change\n    const oldPosition = antiCheat.playerPositions.get(socket.id);\n    const newPosition = { x: data.x, z: data.z };\n    \n    if (!validatePlayerPosition(socket.id, newPosition, oldPosition, deltaTime)) {\n      // Reject the movement\n      socket.emit('positionCorrection', { x: oldPosition.x, z: oldPosition.z });\n      return;\n    }\n    \n    // Update positions\n    boat.x = data.x;\n    boat.z = data.z;\n    boat.rotation = data.rotation;\n    boat.velocity = data.velocity || { x: 0, z: 0 };\n    \n    player.x = data.x;\n    player.z = data.z;\n    player.rotation = data.playerRotation || data.rotation;\n    player.lastUpdate = now;\n    \n    antiCheat.playerPositions.set(socket.id, {\n      x: data.x,\n      z: data.z,\n      timestamp: now\n    });\n    \n    // Broadcast to other players\n    socket.broadcast.emit('playerMoved', {\n      id: socket.id,\n      x: data.x,\n      z: data.z,\n      rotation: data.rotation,\n      playerRotation: data.playerRotation,\n      velocity: data.velocity\n    });\n  });\n  \n  // Player shooting\n  socket.on('playerShoot', (data) => {\n    if (!checkRateLimit('shooting', socket.id, 20, 1000)) {\n      return; // Rate limited\n    }\n    \n    const player = gameState.players.get(socket.id);\n    if (!player) return;\n    \n    const weaponType = data.weapon || player.weapon;\n    \n    // Validate shot timing\n    if (!validateShot(socket.id, weaponType)) {\n      return;\n    }\n    \n    // Create projectiles\n    if (data.projectiles && Array.isArray(data.projectiles)) {\n      data.projectiles.forEach((projData, index) => {\n        const projectile = {\n          id: uuidv4(),\n          playerId: socket.id,\n          weapon: weaponType,\n          x: projData.origin[0],\n          y: projData.origin[1],\n          z: projData.origin[2],\n          vx: projData.direction[0] * 800, // Base projectile speed\n          vy: projData.direction[1] * 800,\n          vz: projData.direction[2] * 800,\n          damage: projData.damage,\n          age: 0,\n          timestamp: Date.now()\n        };\n        \n        gameState.projectiles.set(projectile.id, projectile);\n      });\n    }\n    \n    // Broadcast shot to other players\n    socket.broadcast.emit('playerShot', {\n      playerId: socket.id,\n      weapon: weaponType,\n      position: data.projectiles ? data.projectiles[0].origin : [player.x, player.y, player.z],\n      direction: data.projectiles ? data.projectiles[0].direction : [0, 0, -1]\n    });\n  });\n  \n  // Projectile hit\n  socket.on('projectileHit', (data) => {\n    const shooter = gameState.players.get(socket.id);\n    const target = gameState.players.get(data.targetId);\n    \n    if (!shooter || !target) return;\n    \n    // Calculate actual damage\n    const distance = Math.sqrt(\n      Math.pow(shooter.x - target.x, 2) +\n      Math.pow(shooter.z - target.z, 2)\n    );\n    \n    const actualDamage = calculateDamage(data.weapon, distance, target.armor);\n    \n    // Validate damage (prevent cheating)\n    if (Math.abs(actualDamage - data.damage) > 10) {\n      console.log(`[ANTI-CHEAT] Player ${socket.id} sent invalid damage: ${data.damage} vs calculated ${actualDamage}`);\n      return;\n    }\n    \n    // Apply damage\n    let armorDamage = 0;\n    let healthDamage = actualDamage;\n    \n    if (target.armor > 0) {\n      armorDamage = Math.min(target.armor, actualDamage * 0.7);\n      target.armor -= armorDamage;\n      healthDamage = actualDamage - armorDamage;\n    }\n    \n    target.health -= healthDamage;\n    \n    // Check for death\n    if (target.health <= 0) {\n      target.health = 0;\n      target.deaths++;\n      shooter.kills++;\n      shooter.score += 100;\n      gameState.gameStats.totalKills++;\n      gameState.gameStats.totalDeaths++;\n      \n      // Respawn target\n      setTimeout(() => {\n        target.health = target.maxHealth;\n        target.armor = 0;\n        target.x = (Math.random() - 0.5) * 1000;\n        target.z = (Math.random() - 0.5) * 1000;\n        \n        const targetBoat = gameState.boats.get(data.targetId);\n        if (targetBoat) {\n          targetBoat.x = target.x;\n          targetBoat.z = target.z;\n          targetBoat.health = targetBoat.maxHealth;\n        }\n        \n        io.emit('playerRespawned', {\n          playerId: data.targetId,\n          position: { x: target.x, z: target.z },\n          health: target.health,\n          armor: target.armor\n        });\n      }, 3000);\n      \n      io.emit('playerKilled', {\n        killer: socket.id,\n        killerName: shooter.username,\n        victim: data.targetId,\n        victimName: target.username,\n        weapon: data.weapon,\n        position: data.position\n      });\n    } else {\n      // Just damaged\n      io.emit('playerDamaged', {\n        playerId: data.targetId,\n        health: target.health,\n        armor: target.armor,\n        damage: actualDamage\n      });\n    }\n  });\n  \n  // Power-up collection\n  socket.on('powerUpCollected', (data) => {\n    const powerUp = gameState.powerUps.get(data.id);\n    const player = gameState.players.get(socket.id);\n    \n    if (!powerUp || !player || powerUp.taken) return;\n    \n    // Validate distance\n    const distance = Math.sqrt(\n      Math.pow(player.x - powerUp.x, 2) +\n      Math.pow(player.z - powerUp.z, 2)\n    );\n    \n    if (distance > 5) {\n      console.log(`[ANTI-CHEAT] Player ${socket.id} tried to collect power-up from too far: ${distance}m`);\n      return;\n    }\n    \n    powerUp.taken = true;\n    powerUp.lastTaken = Date.now();\n    \n    // Apply power-up effect\n    switch (powerUp.type) {\n      case 'health':\n        player.health = Math.min(player.maxHealth, player.health + 25);\n        break;\n      case 'armor':\n        player.armor = Math.min(player.maxArmor, player.armor + 50);\n        break;\n      case 'ammo':\n        // Implementation depends on ammo system\n        break;\n      case 'weapon':\n        // Implementation depends on weapon system\n        break;\n    }\n    \n    io.emit('powerUpCollected', {\n      id: data.id,\n      playerId: socket.id,\n      type: powerUp.type,\n      playerStats: {\n        health: player.health,\n        armor: player.armor\n      }\n    });\n  });\n  \n  // Chat messages\n  socket.on('chatMessage', (data) => {\n    if (!checkRateLimit('chat', socket.id, 5, 10000)) {\n      socket.emit('chatError', 'You are sending messages too quickly.');\n      return;\n    }\n    \n    const player = gameState.players.get(socket.id);\n    if (!player) return;\n    \n    // Basic message filtering\n    const message = data.message.substring(0, 200).trim();\n    if (message.length === 0) return;\n    \n    io.emit('chatMessage', {\n      playerId: socket.id,\n      playerName: player.username,\n      message: message,\n      timestamp: Date.now()\n    });\n  });\n  \n  // Player disconnect\n  socket.on('disconnect', () => {\n    console.log(`[${new Date().toISOString()}] Player disconnected: ${socket.id}`);\n    \n    gameState.players.delete(socket.id);\n    gameState.boats.delete(socket.id);\n    antiCheat.playerPositions.delete(socket.id);\n    antiCheat.shotCooldowns.delete(socket.id);\n    \n    // Clean up rate limits\n    Object.values(rateLimits).forEach(map => map.delete(socket.id));\n    \n    socket.broadcast.emit('playerLeft', socket.id);\n  });\n  \n  // Ping measurement\n  socket.on('ping', (timestamp) => {\n    socket.emit('pong', timestamp);\n  });\n});\n\n// Game loop\nsetInterval(() => {\n  updateGameWorld();\n  \n  // Send periodic updates\n  const gameUpdate = {\n    projectiles: Array.from(gameState.projectiles.values()),\n    weather: gameState.weather,\n    timeOfDay: gameState.timeOfDay,\n    playerCount: gameState.players.size,\n    serverTime: Date.now()\n  };\n  \n  io.emit('gameUpdate', gameUpdate);\n}, MS_PER_TICK);\n\n// Send leaderboard updates every 5 seconds\nsetInterval(() => {\n  const leaderboard = Array.from(gameState.players.values())\n    .sort((a, b) => b.score - a.score)\n    .slice(0, 10)\n    .map(player => ({\n      id: player.id,\n      username: player.username,\n      score: player.score,\n      kills: player.kills,\n      deaths: player.deaths\n    }));\n  \n  io.emit('leaderboardUpdate', leaderboard);\n}, 5000);\n\n// Server statistics\nsetInterval(() => {\n  const stats = {\n    players: gameState.players.size,\n    uptime: Date.now() - gameState.gameStats.gameStartTime,\n    totalKills: gameState.gameStats.totalKills,\n    totalPlayers: gameState.gameStats.playersJoined,\n    projectiles: gameState.projectiles.size,\n    powerUps: gameState.powerUps.size\n  };\n  \n  console.log(`[STATS] Players: ${stats.players}/${MAX_PLAYERS}, Uptime: ${Math.floor(stats.uptime/1000)}s, Kills: ${stats.totalKills}`);\n}, 30000);\n\nserver.listen(PORT, () => {\n  console.log(`=== Advanced Boat Battle FPS Server ===`);\n  console.log(`Port: ${PORT}`);\n  console.log(`Max Players: ${MAX_PLAYERS}`);\n  console.log(`Tick Rate: ${TICK_RATE}Hz`);\n  console.log(`Anti-cheat: Enabled`);\n  console.log(`Islands: ${gameState.islands.length}`);\n  console.log(`Power-ups: ${gameState.powerUps.size}`);\n  console.log(`=======================================`);\n});
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+const MAX_PLAYERS = 100;
+const TICK_RATE = 60; // Server update rate
+const MS_PER_TICK = 1000 / TICK_RATE;
+
+// Advanced game state
+const gameState = {
+  players: new Map(),
+  boats: new Map(),
+  projectiles: new Map(),
+  powerUps: new Map(),
+  islands: [],
+  gameStats: {
+    totalKills: 0,
+    totalDeaths: 0,
+    gameStartTime: Date.now(),
+    playersJoined: 0
+  },
+  weather: {
+    type: 'clear', // clear, rain, storm, fog
+    intensity: 0,
+    windDirection: { x: 1, y: 0, z: 0.5 },
+    windStrength: 0.3
+  },
+  timeOfDay: 0.5 // 0 = midnight, 0.5 = noon
+};
+
+// Anti-cheat system
+const antiCheat = {
+  playerPositions: new Map(),
+  shotCooldowns: new Map(),
+  speedChecks: new Map(),
+  damageValidation: new Map()
+};
+
+// Rate limiting
+const rateLimits = {
+  movement: new Map(),
+  shooting: new Map(),
+  chat: new Map()
+};
+
+function generateAdvancedIslands() {
+  const islands = [];
+  const islandCount = 25;
+  
+  for (let i = 0; i < islandCount; i++) {
+    const island = {
+      id: uuidv4(),
+      x: (Math.random() - 0.5) * 4000,
+      z: (Math.random() - 0.5) * 4000,
+      radius: 40 + Math.random() * 120,
+      height: 15 + Math.random() * 50,
+      type: Math.random() > 0.7 ? 'rocky' : 'tropical',
+      powerUps: []
+    };
+    
+    // Add power-ups to larger islands
+    if (island.radius > 80) {
+      const powerUpCount = 2 + Math.floor(Math.random() * 3);
+      for (let j = 0; j < powerUpCount; j++) {
+        const powerUp = {
+          id: uuidv4(),
+          type: ['health', 'armor', 'ammo', 'weapon'][Math.floor(Math.random() * 4)],
+          x: island.x + (Math.random() - 0.5) * (island.radius - 10),
+          z: island.z + (Math.random() - 0.5) * (island.radius - 10),
+          y: island.height + 2,
+          respawnTime: 30000, // 30 seconds
+          lastTaken: 0
+        };
+        island.powerUps.push(powerUp);
+        gameState.powerUps.set(powerUp.id, powerUp);
+      }
+    }
+    
+    islands.push(island);
+  }
+  
+  return islands;
+}
+
+function validatePlayerPosition(playerId, newPosition, oldPosition, deltaTime) {
+  if (!oldPosition) return true;
+  
+  const distance = Math.sqrt(
+    Math.pow(newPosition.x - oldPosition.x, 2) +
+    Math.pow(newPosition.z - oldPosition.z, 2)
+  );
+  
+  const maxSpeed = 35; // m/s (generous for boats)
+  const maxDistance = maxSpeed * deltaTime;
+  
+  if (distance > maxDistance) {
+    console.log(`[ANTI-CHEAT] Player ${playerId} moved too fast: ${distance}m in ${deltaTime}s`);
+    return false;
+  }
+  
+  return true;
+}
+
+function validateShot(playerId, weaponType) {
+  const now = Date.now();
+  const lastShot = antiCheat.shotCooldowns.get(playerId) || 0;
+  
+  // Weapon fire rates (shots per minute)
+  const fireRates = {
+    'rifle': 600,
+    'pistol': 300,
+    'shotgun': 120,
+    'sniper': 40,
+    'smg': 800,
+    'lmg': 500
+  };
+  
+  const fireRate = fireRates[weaponType] || 600;
+  const minInterval = (60 / fireRate) * 1000; // Convert to milliseconds
+  
+  if (now - lastShot < minInterval * 0.8) { // Allow 20% tolerance
+    console.log(`[ANTI-CHEAT] Player ${playerId} firing too fast with ${weaponType}`);
+    return false;
+  }
+  
+  antiCheat.shotCooldowns.set(playerId, now);
+  return true;
+}
+
+function checkRateLimit(type, playerId, limit = 10, window = 1000) {
+  const now = Date.now();
+  
+  if (!rateLimits[type].has(playerId)) {
+    rateLimits[type].set(playerId, []);
+  }
+  
+  const timestamps = rateLimits[type].get(playerId);
+  
+  // Remove old timestamps
+  while (timestamps.length > 0 && now - timestamps[0] > window) {
+    timestamps.shift();
+  }
+  
+  if (timestamps.length >= limit) {
+    return false;
+  }
+  
+  timestamps.push(now);
+  return true;
+}
+
+function calculateDamage(weapon, distance, targetArmor) {
+  const weapons = {
+    'rifle': { damage: 35, range: 800, falloff: 0.3 },
+    'pistol': { damage: 65, range: 400, falloff: 0.4 },
+    'shotgun': { damage: 25, range: 200, falloff: 0.6, pellets: 8 },
+    'sniper': { damage: 150, range: 2000, falloff: 0.1 },
+    'smg': { damage: 28, range: 300, falloff: 0.5 },
+    'lmg': { damage: 45, range: 1000, falloff: 0.2 }
+  };
+  
+  const weaponData = weapons[weapon] || weapons['rifle'];
+  let damage = weaponData.damage;
+  
+  // Apply distance falloff
+  if (distance > weaponData.range * 0.3) {
+    const falloffFactor = 1 - ((distance - weaponData.range * 0.3) / (weaponData.range * 0.7));
+    damage *= Math.max(0.2, falloffFactor);
+  }
+  
+  // Apply armor reduction
+  if (targetArmor > 0) {
+    const armorReduction = Math.min(targetArmor, damage * 0.7);
+    damage -= armorReduction;
+  }
+  
+  return Math.round(damage);
+}
+
+function updateGameWorld() {
+  // Update time of day
+  gameState.timeOfDay += 0.001; // Slow progression
+  if (gameState.timeOfDay > 1) gameState.timeOfDay = 0;
+  
+  // Update weather
+  if (Math.random() < 0.001) { // 0.1% chance per tick to change weather
+    const weatherTypes = ['clear', 'rain', 'storm', 'fog'];
+    gameState.weather.type = weatherTypes[Math.floor(Math.random() * weatherTypes.length)];
+    gameState.weather.intensity = Math.random();
+  }
+  
+  // Update projectiles
+  const now = Date.now();
+  for (const [id, projectile] of gameState.projectiles) {
+    projectile.age += MS_PER_TICK;
+    
+    // Update position
+    projectile.x += projectile.vx * (MS_PER_TICK / 1000);
+    projectile.y += projectile.vy * (MS_PER_TICK / 1000);
+    projectile.z += projectile.vz * (MS_PER_TICK / 1000);
+    
+    // Apply gravity
+    projectile.vy -= 9.81 * (MS_PER_TICK / 1000);
+    
+    // Check for collisions or expiry
+    if (projectile.age > 5000 || projectile.y < 0) {
+      gameState.projectiles.delete(id);
+      io.emit('projectileExpired', id);
+    }
+  }
+  
+  // Respawn power-ups
+  for (const [id, powerUp] of gameState.powerUps) {
+    if (powerUp.taken && now - powerUp.lastTaken > powerUp.respawnTime) {
+      powerUp.taken = false;
+      io.emit('powerUpRespawned', { id: id, type: powerUp.type, position: { x: powerUp.x, y: powerUp.y, z: powerUp.z } });
+    }
+  }
+}
+
+// Initialize islands after gameState is defined
+gameState.islands = generateAdvancedIslands();
+
+app.use(express.static('public'));
+
+io.on('connection', (socket) => {
+  console.log(`[${new Date().toISOString()}] Player connected: ${socket.id}`);
+  
+  // Check server capacity
+  if (gameState.players.size >= MAX_PLAYERS) {
+    socket.emit('serverFull', { message: 'Server is full. Please try again later.' });
+    socket.disconnect();
+    return;
+  }
+  
+  // Initialize player
+  const player = {
+    id: socket.id,
+    username: `Player${gameState.players.size + 1}`,
+    x: (Math.random() - 0.5) * 1000,
+    y: 2,
+    z: (Math.random() - 0.5) * 1000,
+    rotation: 0,
+    health: 100,
+    maxHealth: 100,
+    armor: 0,
+    maxArmor: 100,
+    score: 0,
+    kills: 0,
+    deaths: 0,
+    weapon: 'rifle',
+    onFoot: false,
+    lastUpdate: Date.now(),
+    joinTime: Date.now()
+  };
+  
+  const boat = {
+    id: socket.id,
+    x: player.x,
+    z: player.z,
+    rotation: 0,
+    velocity: { x: 0, z: 0 },
+    health: 100,
+    maxHealth: 100
+  };
+  
+  gameState.players.set(socket.id, player);
+  gameState.boats.set(socket.id, boat);
+  gameState.gameStats.playersJoined++;
+  
+  // Initialize anti-cheat tracking
+  antiCheat.playerPositions.set(socket.id, { x: player.x, z: player.z, timestamp: Date.now() });
+  antiCheat.shotCooldowns.set(socket.id, 0);
+  
+  // Send initial game state
+  socket.emit('gameInit', {
+    playerId: socket.id,
+    gameState: {
+      players: Array.from(gameState.players.values()),
+      boats: Array.from(gameState.boats.values()),
+      islands: gameState.islands,
+      powerUps: Array.from(gameState.powerUps.values()).filter(p => !p.taken),
+      weather: gameState.weather,
+      timeOfDay: gameState.timeOfDay
+    }
+  });
+  
+  // Notify other players
+  socket.broadcast.emit('playerJoined', { 
+    player: player, 
+    boat: boat 
+  });
+  
+  // Player movement
+  socket.on('playerMove', (data) => {
+    if (!checkRateLimit('movement', socket.id, 30, 1000)) {
+      return; // Rate limited
+    }
+    
+    const player = gameState.players.get(socket.id);
+    const boat = gameState.boats.get(socket.id);
+    
+    if (!player || !boat) return;
+    
+    const now = Date.now();
+    const deltaTime = (now - player.lastUpdate) / 1000;
+    
+    // Validate position change
+    const oldPosition = antiCheat.playerPositions.get(socket.id);
+    const newPosition = { x: data.x, z: data.z };
+    
+    if (!validatePlayerPosition(socket.id, newPosition, oldPosition, deltaTime)) {
+      // Reject the movement
+      socket.emit('positionCorrection', { x: oldPosition.x, z: oldPosition.z });
+      return;
+    }
+    
+    // Update positions
+    boat.x = data.x;
+    boat.z = data.z;
+    boat.rotation = data.rotation;
+    boat.velocity = data.velocity || { x: 0, z: 0 };
+    
+    player.x = data.x;
+    player.z = data.z;
+    player.rotation = data.playerRotation || data.rotation;
+    player.lastUpdate = now;
+    
+    antiCheat.playerPositions.set(socket.id, {
+      x: data.x,
+      z: data.z,
+      timestamp: now
+    });
+    
+    // Broadcast to other players
+    socket.broadcast.emit('playerMoved', {
+      id: socket.id,
+      x: data.x,
+      z: data.z,
+      rotation: data.rotation,
+      playerRotation: data.playerRotation,
+      velocity: data.velocity
+    });
+  });
+  
+  // Player shooting
+  socket.on('playerShoot', (data) => {
+    if (!checkRateLimit('shooting', socket.id, 20, 1000)) {
+      return; // Rate limited
+    }
+    
+    const player = gameState.players.get(socket.id);
+    if (!player) return;
+    
+    const weaponType = data.weapon || player.weapon;
+    
+    // Validate shot timing
+    if (!validateShot(socket.id, weaponType)) {
+      return;
+    }
+    
+    // Create projectiles
+    if (data.projectiles && Array.isArray(data.projectiles)) {
+      data.projectiles.forEach((projData, index) => {
+        const projectile = {
+          id: uuidv4(),
+          playerId: socket.id,
+          weapon: weaponType,
+          x: projData.origin[0],
+          y: projData.origin[1],
+          z: projData.origin[2],
+          vx: projData.direction[0] * 800, // Base projectile speed
+          vy: projData.direction[1] * 800,
+          vz: projData.direction[2] * 800,
+          damage: projData.damage,
+          age: 0,
+          timestamp: Date.now()
+        };
+        
+        gameState.projectiles.set(projectile.id, projectile);
+      });
+    }
+    
+    // Broadcast shot to other players
+    socket.broadcast.emit('playerShot', {
+      playerId: socket.id,
+      weapon: weaponType,
+      position: data.projectiles ? data.projectiles[0].origin : [player.x, player.y, player.z],
+      direction: data.projectiles ? data.projectiles[0].direction : [0, 0, -1]
+    });
+  });
+  
+  socket.on('disconnect', () => {
+    console.log(`[${new Date().toISOString()}] Player disconnected: ${socket.id}`);
+    
+    gameState.players.delete(socket.id);
+    gameState.boats.delete(socket.id);
+    antiCheat.playerPositions.delete(socket.id);
+    antiCheat.shotCooldowns.delete(socket.id);
+    
+    // Clean up rate limits
+    Object.values(rateLimits).forEach(map => map.delete(socket.id));
+    
+    socket.broadcast.emit('playerLeft', socket.id);
+  });
+});
+
+// Game loop
+setInterval(() => {
+  updateGameWorld();
+  
+  // Send periodic updates
+  const gameUpdate = {
+    projectiles: Array.from(gameState.projectiles.values()),
+    weather: gameState.weather,
+    timeOfDay: gameState.timeOfDay,
+    playerCount: gameState.players.size,
+    serverTime: Date.now()
+  };
+  
+  io.emit('gameUpdate', gameUpdate);
+}, MS_PER_TICK);
+
+// Send leaderboard updates every 5 seconds
+setInterval(() => {
+  const leaderboard = Array.from(gameState.players.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10)
+    .map(player => ({
+      id: player.id,
+      username: player.username,
+      score: player.score,
+      kills: player.kills,
+      deaths: player.deaths
+    }));
+  
+  io.emit('leaderboardUpdate', leaderboard);
+}, 5000);
+
+// Server statistics
+setInterval(() => {
+  const stats = {
+    players: gameState.players.size,
+    uptime: Date.now() - gameState.gameStats.gameStartTime,
+    totalKills: gameState.gameStats.totalKills,
+    totalPlayers: gameState.gameStats.playersJoined,
+    projectiles: gameState.projectiles.size,
+    powerUps: gameState.powerUps.size
+  };
+  
+  console.log(`[STATS] Players: ${stats.players}/${MAX_PLAYERS}, Uptime: ${Math.floor(stats.uptime/1000)}s, Kills: ${stats.totalKills}`);
+}, 30000);
+
+server.listen(PORT, () => {
+  console.log(`=== Advanced Boat Battle FPS Server ===`);
+  console.log(`Port: ${PORT}`);
+  console.log(`Max Players: ${MAX_PLAYERS}`);
+  console.log(`Tick Rate: ${TICK_RATE}Hz`);
+  console.log(`Anti-cheat: Enabled`);
+  console.log(`Islands: ${gameState.islands.length}`);
+  console.log(`Power-ups: ${gameState.powerUps.size}`);
+  console.log(`=======================================`);
+});
