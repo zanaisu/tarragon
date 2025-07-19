@@ -4,8 +4,10 @@
   "description": "100-player FPS boat battle game",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js",
+    "start": "node server-advanced.js",
+    "start-basic": "node server.js",
+    "dev": "nodemon server-advanced.js",
+    "dev-basic": "nodemon server.js",
     "client": "live-server public",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
