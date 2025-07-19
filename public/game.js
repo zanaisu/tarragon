@@ -207,7 +207,7 @@ class BoatBattleFPS {
         document.addEventListener('mousemove', (event) => {
             if (this.isPointerLocked) {
                 this.mouse.x += event.movementX * 0.002;
-                this.mouse.y += event.movementY * 0.002;
+                this.mouse.y -= event.movementY * 0.002;
                 this.mouse.y = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, this.mouse.y));
             }
         });
