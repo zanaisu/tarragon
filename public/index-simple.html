@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Boat Battle FPS - Simple Test</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #001122;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+        
+        #gameContainer {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            z-index: 100;
+            font-size: 16px;
+        }
+        
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 20px;
+            height: 20px;
+            z-index: 100;
+            pointer-events: none;
+        }
+        
+        #crosshair::before,
+        #crosshair::after {
+            content: '';
+            position: absolute;
+            background: white;
+        }
+        
+        #crosshair::before {
+            top: 50%;
+            left: 0;
+            right: 0;
+            height: 2px;
+            transform: translateY(-50%);
+        }
+        
+        #crosshair::after {
+            left: 50%;
+            top: 0;
+            bottom: 0;
+            width: 2px;
+            transform: translateX(-50%);
+        }
+        
+        #status {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="gameContainer">
+        <div id="ui">
+            <div>Health: <span id="health">100</span></div>
+            <div>Score: <span id="score">0</span></div>
+            <div>Players: <span id="playerCount">0</span>/100</div>
+        </div>
+        
+        <div id="crosshair"></div>
+        
+        <div id="status">
+            <div><strong>Test Controls:</strong></div>
+            <div>WASD - Move boat</div>
+            <div>Mouse - Look around</div>
+            <div>Click - Shoot</div>
+            <div id="debug">Loading...</div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <script>
+        // Simple test version to verify Three.js and Socket.IO are working
+        console.log('Starting simple test...');
+        
+        let scene, camera, renderer, cube;
+        let socket;
+        
+        function init() {
+            console.log('Initializing Three.js...');
+            
+            // Check if Three.js loaded
+            if (typeof THREE === 'undefined') {
+                document.getElementById('debug').textContent = 'ERROR: Three.js failed to load';
+                return;
+            }
+            
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(0x87CEEB);
+            document.getElementById('gameContainer').appendChild(renderer.domElement);
+            
+            // Add a simple cube to test rendering
+            const geometry = new THREE.BoxGeometry();
+            const material = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+            cube = new THREE.Mesh(geometry, material);
+            scene.add(cube);
+            
+            camera.position.z = 5;
+            
+            document.getElementById('debug').textContent = 'Three.js loaded successfully!';
+            
+            // Test Socket.IO connection
+            console.log('Connecting to server...');
+            socket = io();
+            
+            socket.on('connect', () => {
+                console.log('Connected to server!');
+                document.getElementById('debug').textContent = 'Connected to server!';
+            });
+            
+            socket.on('gameInit', (data) => {
+                console.log('Game initialized:', data);
+                document.getElementById('debug').textContent = 'Game ready!';
+            });
+            
+            socket.on('disconnect', () => {
+                console.log('Disconnected from server');
+                document.getElementById('debug').textContent = 'Disconnected';
+            });
+            
+            // Start render loop
+            animate();
+        }
+        
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // Rotate the cube to show animation is working
+            if (cube) {
+                cube.rotation.x += 0.01;
+                cube.rotation.y += 0.01;
+            }
+            
+            renderer.render(scene, camera);
+        }
+        
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+        
+        // Start the test
+        init();
+    </script>
+</body>
+</html>
