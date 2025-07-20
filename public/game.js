@@ -11,6 +11,12 @@ class BoatBattleFPS {
         this.boats = new Map();
         this.bullets = new Map();
         this.islands = [];
+        this.weapons = new Map();
+        this.onFoot = false;
+        this.currentWeapon = 'rifle';
+        this.weaponSlots = ['rifle', 'pistol', 'shotgun'];
+        this.islandColliders = [];
+        this.sounds = {};
         
         this.keys = {};
         this.mouse = { x: 0, y: 0 };
@@ -29,8 +35,10 @@ class BoatBattleFPS {
         this.water = null;
         
         this.init();
+        this.initSounds();
         this.setupEventListeners();
         this.setupSocketEvents();
+        this.updateUI(); // Initialize UI
         this.animate();
     }
     
@@ -55,6 +63,50 @@ class BoatBattleFPS {
         
         this.createWater();
         this.createPlayerBoat();
+    }
+    
+    initSounds() {
+        // Create basic sound effects using Web Audio API
+        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        
+        this.sounds = {
+            shoot: this.createSound(800, 0.1, 'square'),
+            exit: this.createSound(400, 0.2, 'sine'),
+            enter: this.createSound(600, 0.2, 'sine'),
+            hit: this.createSound(200, 0.1, 'sawtooth'),
+            engine: null // Will be a continuous sound
+        };
+    }
+    
+    createSound(frequency, duration, type = 'sine') {
+        return () => {
+            if (!this.audioContext) return;
+            
+            const oscillator = this.audioContext.createOscillator();
+            const gainNode = this.audioContext.createGain();
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(this.audioContext.destination);
+            
+            oscillator.frequency.value = frequency;
+            oscillator.type = type;
+            
+            gainNode.gain.setValueAtTime(0.1, this.audioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + duration);
+            
+            oscillator.start(this.audioContext.currentTime);
+            oscillator.stop(this.audioContext.currentTime + duration);
+        };
+    }
+    
+    playSound(soundName) {
+        if (this.sounds[soundName] && typeof this.sounds[soundName] === 'function') {
+            try {
+                this.sounds[soundName]();
+            } catch (e) {
+                console.log('Sound playback failed:', e);
+            }
+        }
     }
     
     createWater() {
@@ -174,6 +226,16 @@ class BoatBattleFPS {
         islandGroup.add(island);
         this.scene.add(islandGroup);
         
+        // Store collision data
+        this.islandColliders.push({
+            x: islandData.x,
+            z: islandData.z,
+            radius: islandData.radius + 10 // Add buffer
+        });
+        
+        // Add weapons on islands
+        this.spawnWeaponsOnIsland(islandData);
+        
         return islandGroup;
     }
     
@@ -186,6 +248,21 @@ class BoatBattleFPS {
     setupEventListeners() {
         document.addEventListener('keydown', (event) => {
             this.keys[event.code] = true;
+            
+            // Exit boat
+            if (event.code === 'KeyF' && !this.onFoot) {
+                this.exitBoat();
+            }
+            
+            // Enter boat
+            if (event.code === 'KeyF' && this.onFoot) {
+                this.enterBoat();
+            }
+            
+            // Weapon switching
+            if (event.code === 'Digit1') this.switchWeapon(0);
+            if (event.code === 'Digit2') this.switchWeapon(1);
+            if (event.code === 'Digit3') this.switchWeapon(2);
         });
         
         document.addEventListener('keyup', (event) => {
@@ -193,6 +270,11 @@ class BoatBattleFPS {
         });
         
         document.addEventListener('click', () => {
+            // Enable audio context on first user interaction
+            if (this.audioContext && this.audioContext.state === 'suspended') {
+                this.audioContext.resume();
+            }
+            
             if (!this.isPointerLocked) {
                 this.renderer.domElement.requestPointerLock();
             } else {
@@ -207,7 +289,7 @@ class BoatBattleFPS {
         document.addEventListener('mousemove', (event) => {
             if (this.isPointerLocked) {
                 this.mouse.x += event.movementX * 0.002;
-                this.mouse.y += event.movementY * 0.002;
+                this.mouse.y -= event.movementY * 0.002;
                 this.mouse.y = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, this.mouse.y));
             }
         });
@@ -311,19 +393,40 @@ class BoatBattleFPS {
     }
     
     updateMovement() {
-        const speed = 0.5;
-        const rotationSpeed = 0.03;
+        if (this.onFoot) {
+            this.updateFootMovement();
+        } else {
+            this.updateBoatMovement();
+        }
+    }
+    
+    updateBoatMovement() {
+        const speed = 0.15; // Reduced speed
         
-        if (this.keys['KeyW']) this.playerData.velocity.z -= speed;
-        if (this.keys['KeyS']) this.playerData.velocity.z += speed;
-        if (this.keys['KeyA']) this.playerData.velocity.x -= speed;
-        if (this.keys['KeyD']) this.playerData.velocity.x += speed;
+        // Fix WASD directions - forward/back based on boat rotation
+        const boatForward = new THREE.Vector3(
+            -Math.sin(this.boat.rotation.y), // Negative for correct forward
+            0,
+            -Math.cos(this.boat.rotation.y)  // Negative for correct forward
+        );
+        const boatRight = new THREE.Vector3(
+            Math.cos(this.boat.rotation.y),
+            0,
+            -Math.sin(this.boat.rotation.y)
+        );
         
-        this.playerData.velocity.x *= 0.9;
-        this.playerData.velocity.z *= 0.9;
+        const moveVector = new THREE.Vector3(0, 0, 0);
         
-        this.boat.position.x += this.playerData.velocity.x;
-        this.boat.position.z += this.playerData.velocity.z;
+        if (this.keys['KeyW']) moveVector.add(boatForward.clone().multiplyScalar(speed));
+        if (this.keys['KeyS']) moveVector.add(boatForward.clone().multiplyScalar(-speed));
+        if (this.keys['KeyA']) moveVector.add(boatRight.clone().multiplyScalar(-speed));
+        if (this.keys['KeyD']) moveVector.add(boatRight.clone().multiplyScalar(speed));
+        
+        // Apply movement with collision detection
+        const newPos = this.boat.position.clone().add(moveVector);
+        if (!this.checkCollision(newPos)) {
+            this.boat.position.copy(newPos);
+        }
         
         this.boat.rotation.y = this.mouse.x;
         this.camera.rotation.x = this.mouse.y;
@@ -333,8 +436,36 @@ class BoatBattleFPS {
             z: this.boat.position.z,
             rotation: this.boat.rotation.y,
             playerRotation: this.mouse.x,
-            velocity: this.playerData.velocity
+            velocity: { x: moveVector.x, z: moveVector.z }
         });
+    }
+    
+    updateFootMovement() {
+        const speed = 0.2;
+        
+        // Camera-relative movement for on-foot
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+        
+        forward.y = 0;
+        right.y = 0;
+        forward.normalize();
+        right.normalize();
+        
+        const moveVector = new THREE.Vector3(0, 0, 0);
+        
+        if (this.keys['KeyW']) moveVector.add(forward.clone().multiplyScalar(speed));
+        if (this.keys['KeyS']) moveVector.add(forward.clone().multiplyScalar(-speed));
+        if (this.keys['KeyA']) moveVector.add(right.clone().multiplyScalar(-speed));
+        if (this.keys['KeyD']) moveVector.add(right.clone().multiplyScalar(speed));
+        
+        const newPos = this.camera.position.clone().add(moveVector);
+        if (!this.checkCollision(newPos)) {
+            this.camera.position.copy(newPos);
+        }
+        
+        this.camera.rotation.x = this.mouse.y;
+        this.camera.rotation.y = this.mouse.x;
     }
     
     shoot() {
@@ -352,6 +483,7 @@ class BoatBattleFPS {
             }
         };
         
+        this.playSound('shoot');
         this.socket.emit('playerShoot', bulletData);
     }
     
@@ -359,6 +491,15 @@ class BoatBattleFPS {
         document.getElementById('health').textContent = this.playerData.health;
         document.getElementById('boatHealth').textContent = this.playerData.boatHealth;
         document.getElementById('score').textContent = this.playerData.score;
+        
+        // Update mode indicator
+        const modeText = this.onFoot ? '👤 On Foot' : '🚤 In Boat';
+        if (!document.getElementById('mode')) {
+            const modeDiv = document.createElement('div');
+            modeDiv.id = 'mode';
+            document.getElementById('ui').appendChild(modeDiv);
+        }
+        document.getElementById('mode').textContent = modeText;
     }
     
     updatePlayerCount() {
@@ -374,6 +515,106 @@ class BoatBattleFPS {
         });
     }
     
+    checkCollision(position) {
+        for (const island of this.islandColliders) {
+            const distance = Math.sqrt(
+                Math.pow(position.x - island.x, 2) + 
+                Math.pow(position.z - island.z, 2)
+            );
+            if (distance < island.radius) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    exitBoat() {
+        if (this.onFoot) return;
+        
+        this.onFoot = true;
+        
+        // Store boat position and camera transform
+        const boatWorldPos = new THREE.Vector3();
+        this.boat.getWorldPosition(boatWorldPos);
+        
+        const cameraWorldPos = new THREE.Vector3();
+        const cameraWorldRot = new THREE.Euler();
+        this.camera.getWorldPosition(cameraWorldPos);
+        this.camera.getWorldQuaternion(new THREE.Quaternion().setFromEuler(cameraWorldRot));
+        
+        // Remove camera from boat
+        this.boat.remove(this.camera);
+        this.scene.add(this.camera);
+        
+        // Position camera next to boat with proper world coordinates
+        this.camera.position.copy(cameraWorldPos);
+        this.camera.position.x += 15;
+        this.camera.position.y = 5; // Ground level
+        
+        this.playSound('exit');
+        console.log('Exited boat - Press F near boat to re-enter');
+    }
+    
+    enterBoat() {
+        if (!this.onFoot) return;
+        
+        // Check if near boat
+        const distance = this.camera.position.distanceTo(this.boat.position);
+        if (distance > 25) {
+            console.log('Too far from boat! Distance: ' + Math.round(distance));
+            return;
+        }
+        
+        this.onFoot = false;
+        this.scene.remove(this.camera);
+        this.boat.add(this.camera);
+        
+        // Reset camera to boat position
+        this.camera.position.set(0, 12, 5);
+        this.camera.rotation.set(0, 0, 0);
+        
+        this.playSound('enter');
+        console.log('Entered boat');
+    }
+    
+    switchWeapon(slot) {
+        if (slot < this.weaponSlots.length) {
+            this.currentWeapon = this.weaponSlots[slot];
+            this.updateHotbar();
+            console.log(`Switched to ${this.currentWeapon}`);
+        }
+    }
+    
+    spawnWeaponsOnIsland(islandData) {
+        // Spawn 2-3 weapons per island
+        for (let i = 0; i < 3; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const distance = Math.random() * (islandData.radius - 10);
+            
+            const weaponTypes = ['rifle', 'pistol', 'shotgun'];
+            const weaponType = weaponTypes[Math.floor(Math.random() * weaponTypes.length)];
+            
+            const weaponGeometry = new THREE.BoxGeometry(2, 0.5, 8);
+            const weaponMaterial = new THREE.MeshLambertMaterial({ color: 0x444444 });
+            const weapon = new THREE.Mesh(weaponGeometry, weaponMaterial);
+            
+            weapon.position.set(
+                islandData.x + Math.cos(angle) * distance,
+                islandData.height + 2,
+                islandData.z + Math.sin(angle) * distance
+            );
+            
+            weapon.userData = { type: weaponType, isWeapon: true };
+            this.scene.add(weapon);
+            this.weapons.set(`${islandData.x}-${islandData.z}-${i}`, weapon);
+        }
+    }
+    
+    updateHotbar() {
+        // Update UI hotbar
+        document.getElementById('currentWeapon').textContent = this.currentWeapon;
+    }
+
     animate() {
         requestAnimationFrame(() => this.animate());
         
